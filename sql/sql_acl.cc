@@ -901,30 +901,33 @@ static bool fix_user_plugin_ptr(ACL_USER *user)
 */
 static bool fix_lex_user(LEX_USER *user)
 {
-  size_t check_length= 0;
+  size_t check_length;
+
   if (my_strcasecmp(system_charset_info, user->plugin.str,
                     native_password_plugin_name.str) == 0)
-  {
     check_length= SCRAMBLED_PASSWORD_CHAR_LENGTH;
-  }
   else
   if (my_strcasecmp(system_charset_info, user->plugin.str,
                     old_password_plugin_name.str) == 0)
-  {
     check_length= SCRAMBLED_PASSWORD_CHAR_LENGTH_323;
+  else
+  if (user->plugin.length)
+    return false; // nothing else to do
+  else
+  if (user->auth.length == SCRAMBLED_PASSWORD_CHAR_LENGTH_323)
+    check_length= 0; // length is valid, no need to re-check
+  else
+    check_length= SCRAMBLED_PASSWORD_CHAR_LENGTH;
+
+  if (check_length && user->auth.length && user->auth.length != check_length)
+  {
+    my_error(ER_PASSWD_LENGTH, MYF(0), check_length);
+    return true;
   }
 
-  if (check_length)
-  {
-    user->password= user->auth.length ? user->auth : null_lex_str;
-    user->plugin= empty_lex_str;
-    user->auth= empty_lex_str;
-    if (user->password.length && user->password.length != check_length)
-    {
-      my_error(ER_PASSWD_LENGTH, MYF(0), check_length);
-      return true;
-    }
-  }
+  user->password= user->auth.length ? user->auth : null_lex_str;
+  user->plugin= empty_lex_str;
+  user->auth= empty_lex_str;
   return false;
 }
 
@@ -5380,8 +5383,11 @@ static bool has_auth(LEX_USER *user, LEX *lex)
          lex->mqh.specified_limits;
 }
 
-static bool copy_and_check_auth(LEX_USER *to, LEX_USER *from, LEX *lex)
+static bool copy_and_check_auth(LEX_USER *to, LEX_USER *from, THD *thd)
 {
+  if (fix_lex_user(from))
+    return true;
+
   if (to != from)
   {
     /* preserve authentication information, if LEX_USER was  reallocated */
@@ -5390,14 +5396,13 @@ static bool copy_and_check_auth(LEX_USER *to, LEX_USER *from, LEX *lex)
     to->auth= from->auth;
   }
 
-  /*
-    Specifying authentication clauses forces the name to be interpreted
-    as a user, not a role. See also check_change_password()
-  */
-  if (to->is_role() && has_auth(to, lex))
+  // if changing auth for an existing user
+  if (has_auth(to, thd->lex) && find_user_exact(to->host.str, to->user.str))
   {
-    my_error(ER_PASSWORD_NO_MATCH, MYF(0));
-    return true;
+    mysql_mutex_unlock(&acl_cache->lock);
+    bool res= check_alter_user(thd, to->host.str, to->user.str);
+    mysql_mutex_lock(&acl_cache->lock);
+    return res;
   }
 
   return false;
@@ -5572,10 +5577,8 @@ int mysql_table_grant(THD *thd, TABLE_LIST *table_list,
       continue;
     }
     /* Create user if needed */
-    if (copy_and_check_auth(Str, tmp_Str, thd->lex))
-      error= -1;
-    else
-      error=replace_user_table(thd, tables[0].table, *Str,
+    error= copy_and_check_auth(Str, tmp_Str, thd) ||
+           replace_user_table(thd, tables[0].table, *Str,
                                0, revoke_grant, create_new_users,
                                MY_TEST(thd->variables.sql_mode &
                                        MODE_NO_AUTO_CREATE_USER));
@@ -5783,7 +5786,7 @@ bool mysql_routine_grant(THD *thd, TABLE_LIST *table_list, bool is_proc,
       continue;
     }
     /* Create user if needed */
-    if (copy_and_check_auth(Str, tmp_Str, thd->lex) ||
+    if (copy_and_check_auth(Str, tmp_Str, thd) ||
         replace_user_table(thd, tables[0].table, *Str,
 			   0, revoke_grant, create_new_users,
                            MY_TEST(thd->variables.sql_mode &
@@ -6065,7 +6068,7 @@ bool mysql_grant_role(THD *thd, List <LEX_USER> &list, bool revoke)
       user_combo.user = username;
 
       /* create the user if it does not exist */
-      if (copy_and_check_auth(&user_combo, &user_combo, thd->lex) ||
+      if (copy_and_check_auth(&user_combo, &user_combo, thd) ||
           replace_user_table(thd, tables[1].table, user_combo, 0,
                              false, create_new_user,
                              no_auto_create_user))
@@ -6275,16 +6278,8 @@ bool mysql_grant(THD *thd, const char *db, List <LEX_USER> &list,
       continue;
     }
 
-    if (fix_lex_user(tmp_Str))
-    {
-      result= TRUE;
-      continue;
-    }
-
-    if (copy_and_check_auth(Str, tmp_Str, thd->lex))
-      result= true;
-    else
-    if (replace_user_table(thd, tables[0].table, *Str,
+    if (copy_and_check_auth(Str, tmp_Str, thd) ||
+        replace_user_table(thd, tables[0].table, *Str,
                            (!db ? rights : 0), revoke_grant, create_new_users,
                            MY_TEST(thd->variables.sql_mode &
                                    MODE_NO_AUTO_CREATE_USER)))
@@ -9905,7 +9900,7 @@ bool sp_grant_privileges(THD *thd, const char *sp_db, const char *sp_name,
   thd->make_lex_string(&combo->user, combo->user.str, strlen(combo->user.str));
   thd->make_lex_string(&combo->host, combo->host.str, strlen(combo->host.str));
 
-  combo->password= empty_lex_str;
+  combo->password= null_lex_str;
   combo->plugin= empty_lex_str;
   combo->auth= empty_lex_str;
 
