@@ -13907,7 +13907,7 @@ user_maybe_role:
               MYSQL_YYABORT;
             $$->user = $1;
             $$->host= null_lex_str; // User or Role, see get_current_user()
-            $$->password= null_lex_str; 
+            $$->password= null_lex_str;
             $$->plugin= empty_lex_str;
             $$->auth= empty_lex_str;
 
@@ -13921,7 +13921,7 @@ user_maybe_role:
             if (!($$=(LEX_USER*) thd->alloc(sizeof(st_lex_user))))
               MYSQL_YYABORT;
             $$->user = $1; $$->host=$3;
-            $$->password= null_lex_str; 
+            $$->password= null_lex_str;
             $$->plugin= empty_lex_str;
             $$->auth= empty_lex_str;
 
@@ -13953,6 +13953,7 @@ user_maybe_role:
             if (!($$=(LEX_USER*)thd->calloc(sizeof(LEX_USER))))
               MYSQL_YYABORT;
             $$->user= current_user;
+            $$->password= null_lex_str;
             $$->plugin= empty_lex_str;
             $$->auth= empty_lex_str;
           }
@@ -15132,6 +15133,7 @@ current_role:
             if (!($$=(LEX_USER*) thd->calloc(sizeof(LEX_USER))))
               MYSQL_YYABORT;
             $$->user= current_role;
+            $$->password= null_lex_str;
             $$->plugin= empty_lex_str;
             $$->auth= empty_lex_str;
           }
@@ -15149,7 +15151,7 @@ grant_role:
               MYSQL_YYABORT;
             $$->user = $1;
             $$->host= empty_lex_str;
-            $$->password= null_lex_str; 
+            $$->password= null_lex_str;
             $$->plugin= empty_lex_str;
             $$->auth= empty_lex_str;
 
@@ -15412,7 +15414,7 @@ grant_user:
             $1->auth= $6;
           }
         | user_or_role
-          { $$= $1; $1->password= null_lex_str; }
+          { $$= $1; }
         ;
 
 opt_column_list:
@@ -15845,7 +15847,10 @@ no_definer:
 definer:
           DEFINER_SYM EQ user_or_role
           {
-            thd->lex->definer= $3;
+            Lex->definer= $3;
+            Lex->ssl_type= SSL_TYPE_NOT_SPECIFIED;
+            Lex->ssl_cipher= Lex->x509_subject= Lex->x509_issuer= 0;
+            bzero(&(Lex->mqh), sizeof(Lex->mqh));
           }
         ;
 
