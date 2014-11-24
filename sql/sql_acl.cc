@@ -2349,7 +2349,7 @@ static void init_check_host(void)
   'acl_user' array, which are invalidated by drop operation, and use
   ACL_USER::host::hostname as a key, which is changed by rename.
 */
-void rebuild_check_host(void)
+static void rebuild_check_host(void)
 {
   delete_dynamic(&acl_wild_hosts);
   my_hash_free(&acl_check_hosts);
@@ -5372,7 +5372,7 @@ static bool merge_one_role_privileges(ACL_ROLE *grantee)
   End of the role privilege propagation and graph traversal code
 ******************************************************************/
 
-bool copy_and_check_auth(LEX_USER *to, LEX_USER *from, LEX *lex)
+static bool copy_and_check_auth(LEX_USER *to, LEX_USER *from, LEX *lex)
 {
   if (to != from)
   {
@@ -6531,7 +6531,8 @@ end_index_init:
 }
 
 
-my_bool role_propagate_grants_action(void *ptr, void *unused __attribute__((unused)))
+static my_bool role_propagate_grants_action(void *ptr,
+                                            void *unused __attribute__((unused)))
 {
   ACL_ROLE *role= (ACL_ROLE *)ptr;
   if (role->counter)
@@ -8340,26 +8341,6 @@ static int open_grant_tables(THD *thd, TABLE_LIST *tables)
   }
 
   DBUG_RETURN(0);
-}
-
-ACL_USER *check_acl_user(LEX_USER *user_name, uint *acl_acl_userdx)
-{
-  ACL_USER *acl_user= 0;
-  uint counter;
-
-  mysql_mutex_assert_owner(&acl_cache->lock);
-
-  for (counter= 0 ; counter < acl_users.elements ; counter++)
-  {
-    acl_user= dynamic_element(&acl_users, counter, ACL_USER*);
-    if(acl_user->eq(user_name->user.str, user_name->host.str))
-      break;
-  }
-  if (counter == acl_users.elements)
-    return 0;
-
-  *acl_acl_userdx= counter;
-  return acl_user;
 }
 
 /*
@@ -12483,9 +12464,3 @@ maria_declare_plugin(mysql_password)
 }
 maria_declare_plugin_end;
 
-
-/* called when new user is created or exsisting password is changed */
-int check_password_policy(String *password)
-{
-  return (0);
-}
