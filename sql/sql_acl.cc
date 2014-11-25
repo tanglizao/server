@@ -352,6 +352,7 @@ ulong role_global_merges= 0, role_db_merges= 0, role_table_merges= 0,
 #endif
 
 #ifndef NO_EMBEDDED_ACCESS_CHECKS
+static bool fix_and_copy_user(LEX_USER *to, LEX_USER *from, THD *thd);
 static void update_hostname(acl_host_and_ip *host, const char *hostname);
 static ulong get_sort(uint count,...);
 static bool show_proxy_grants (THD *, const char *, const char *,
@@ -914,10 +915,25 @@ static bool fix_user_plugin_ptr(ACL_USER *user)
 
 
 /*
-  transform equivalent LEX_USER values to one:
-     username IDENTIFIED BY PASSWORD xxx
-     username IDENTIFIED VIA mysql_native_password USING xxx
-     etc
+  Validates the password, calculates password hash, transforms
+  equivalent LEX_USER representations.
+
+  Upon entering this function:
+
+  - if user->plugin is specified, user->auth is the plugin auth data.
+  - if user->plugin is mysql_native_password or mysql_old_password,
+    user->auth if the password hash, and LEX_USER is transformed
+    to match the next case (that is, user->plugin is cleared).
+  - if user->plugin is NOT specified, built-in auth is assumed, that is
+    mysql_native_password or mysql_old_password. In that case,
+    user->auth is the password hash. And user->password is the original
+    plain-text password. Either one can be set or even both.
+
+  Upon exiting this function:
+
+  - user->password is the password hash, as the mysql.user.password column
+  - user->plugin is the plugin name, as the mysql.user.plugin column
+  - user->auth is the plugin auth data, as the mysql.user.authentication_string column
 */
 static bool fix_lex_user(THD *thd, LEX_USER *user)
 {
@@ -954,7 +970,7 @@ static bool fix_lex_user(THD *thd, LEX_USER *user)
     }
   }
 
-  if (user->password.length)
+  if (user->password.length && !user->auth.length)
   {
     size_t scramble_length;
     void (*make_scramble)(char *, const char *, size_t);
@@ -2581,6 +2597,53 @@ bool acl_check_host(const char *host, const char *ip)
   return 1;					// Host is not allowed
 }
 
+/**
+  Check if the user is allowed to alter the mysql.user table
+
+ @param thd              THD
+ @param host             Hostname for the user
+ @param user             User name
+
+ @return Error status
+   @retval 0 OK
+   @retval 1 Error
+*/
+
+static int check_alter_user(THD *thd, const char *host, const char *user)
+{
+  int error = 1;
+  if (!initialized)
+  {
+    my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--skip-grant-tables");
+    goto end;
+  }
+
+  if (!thd->slave_thread && !thd->security_ctx->priv_user[0])
+  {
+    my_message(ER_PASSWORD_ANONYMOUS_USER, ER(ER_PASSWORD_ANONYMOUS_USER),
+               MYF(0));
+    goto end;
+  }
+  if (!host) // Role
+  {
+    my_error(ER_PASSWORD_NO_MATCH, MYF(0));
+    goto end;
+  }
+
+  if (!thd->slave_thread &&
+      (strcmp(thd->security_ctx->priv_user, user) ||
+       my_strcasecmp(system_charset_info, host,
+                     thd->security_ctx->priv_host)))
+  {
+    if (check_access(thd, UPDATE_ACL, "mysql", NULL, NULL, 1, 0))
+      goto end;
+  }
+
+  error = 0;
+
+end:
+  return error;
+}
 
 /**
   Check if the user is allowed to change password
@@ -2598,41 +2661,16 @@ bool acl_check_host(const char *host, const char *ip)
    @retval 1 ERROR; In this case the error is sent to the client.
 */
 
-int check_change_password(THD *thd, const char *host, const char *user,
-                           char *new_password, uint new_password_len)
+bool check_change_password(THD *thd, LEX_USER *user)
 {
-  if (!initialized)
-  {
-    my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--skip-grant-tables");
-    return(1);
-  }
-  if (!thd->slave_thread && !thd->security_ctx->priv_user[0])
-  {
-    my_message(ER_PASSWORD_ANONYMOUS_USER, ER(ER_PASSWORD_ANONYMOUS_USER),
-               MYF(0));
-    return(1);
-  }
-  if (!host) // Role
-  {
-    my_error(ER_PASSWORD_NO_MATCH, MYF(0));
-    return 1;
-  }
-  if (!thd->slave_thread &&
-      (strcmp(thd->security_ctx->priv_user, user) ||
-       my_strcasecmp(system_charset_info, host,
-                     thd->security_ctx->priv_host)))
-  {
-    if (check_access(thd, UPDATE_ACL, "mysql", NULL, NULL, 1, 0))
-      return(1);
-  }
-  size_t len= strlen(new_password);
-  if (len && len != SCRAMBLED_PASSWORD_CHAR_LENGTH &&
-      len != SCRAMBLED_PASSWORD_CHAR_LENGTH_323)
-  {
-    my_error(ER_PASSWD_LENGTH, MYF(0), SCRAMBLED_PASSWORD_CHAR_LENGTH);
-    return -1;
-  }
-  return(0);
+  LEX_USER *real_user= get_current_user(thd, user);
+
+  if (fix_and_copy_user(real_user, user, thd))
+    return true;
+
+  *user= *real_user;
+
+  return check_alter_user(thd, user->host.str, user->user.str);
 }
 
 
@@ -2640,16 +2678,13 @@ int check_change_password(THD *thd, const char *host, const char *user,
   Change a password for a user.
 
   @param thd            THD
-  @param host           Hostname
-  @param user           User name
-  @param new_password   New password hash for host@user
+  @param user           User, hostname, new password hash
  
   @return Error code
    @retval 0 ok
    @retval 1 ERROR; In this case the error is sent to the client.
 */
-bool change_password(THD *thd, const char *host, const char *user,
-		     char *new_password)
+bool change_password(THD *thd, LEX_USER *user)
 {
   TABLE_LIST tables;
   TABLE *table;
@@ -2658,15 +2693,11 @@ bool change_password(THD *thd, const char *host, const char *user,
   char buff[512];
   ulong query_length;
   enum_binlog_format save_binlog_format;
-  uint new_password_len= (uint) strlen(new_password);
   bool result= 1;
   DBUG_ENTER("change_password");
   DBUG_PRINT("enter",("host: '%s'  user: '%s'  new_password: '%s'",
-		      host,user,new_password));
-  DBUG_ASSERT(host != 0);			// Ensured by parent
-
-  if (check_change_password(thd, host, user, new_password, new_password_len))
-    DBUG_RETURN(1);
+		      user->host.str, user->user.str, user->password.str));
+  DBUG_ASSERT(user->host.str != 0);                     // Ensured by parent
 
   tables.init_one_table("mysql", 5, "user", 4, "user", TL_WRITE);
 
@@ -2702,7 +2733,7 @@ bool change_password(THD *thd, const char *host, const char *user,
 
   mysql_mutex_lock(&acl_cache->lock);
   ACL_USER *acl_user;
-  if (!(acl_user= find_user_exact(host, user)))
+  if (!(acl_user= find_user_exact(user->host.str, user->user.str)))
   {
     mysql_mutex_unlock(&acl_cache->lock);
     my_message(ER_PASSWORD_NO_MATCH, ER(ER_PASSWORD_NO_MATCH), MYF(0));
@@ -2713,10 +2744,10 @@ bool change_password(THD *thd, const char *host, const char *user,
   if (acl_user->plugin.str == native_password_plugin_name.str ||
       acl_user->plugin.str == old_password_plugin_name.str)
   {
-    acl_user->auth_string.str= strmake_root(&acl_memroot, new_password, new_password_len);
-    acl_user->auth_string.length= new_password_len;
-    set_user_salt(acl_user, new_password, new_password_len);
-    set_user_plugin(acl_user, new_password_len);
+    acl_user->auth_string.str= strmake_root(&acl_memroot, user->password.str, user->password.length);
+    acl_user->auth_string.length= user->password.length;
+    set_user_salt(acl_user, user->password.str, user->password.length);
+    set_user_plugin(acl_user, user->password.length);
   }
   else
     push_warning(thd, Sql_condition::WARN_LEVEL_NOTE,
@@ -2725,7 +2756,7 @@ bool change_password(THD *thd, const char *host, const char *user,
   if (update_user_table(thd, table,
                         safe_str(acl_user->host.hostname),
                         safe_str(acl_user->user.str),
-			new_password, new_password_len))
+			safe_str(user->password.str), user->password.length))
   {
     mysql_mutex_unlock(&acl_cache->lock); /* purecov: deadcode */
     goto end;
@@ -2740,7 +2771,7 @@ bool change_password(THD *thd, const char *host, const char *user,
       sprintf(buff,"SET PASSWORD FOR '%-.120s'@'%-.120s'='%-.120s'",
               safe_str(acl_user->user.str),
               safe_str(acl_user->host.hostname),
-              new_password);
+              safe_str(user->password.str));
     thd->clear_error();
     result= thd->binlog_query(THD::STMT_QUERY_TYPE, buff, query_length,
                               FALSE, FALSE, FALSE, 0);
@@ -5436,11 +5467,8 @@ static bool has_auth(LEX_USER *user, LEX *lex)
          lex->mqh.specified_limits;
 }
 
-static bool copy_and_check_auth(LEX_USER *to, LEX_USER *from, THD *thd)
+static bool fix_and_copy_user(LEX_USER *to, LEX_USER *from, THD *thd)
 {
-  if (fix_lex_user(thd, from))
-    return true;
-
   if (to != from)
   {
     /* preserve authentication information, if LEX_USER was  reallocated */
@@ -5448,6 +5476,17 @@ static bool copy_and_check_auth(LEX_USER *to, LEX_USER *from, THD *thd)
     to->plugin= from->plugin;
     to->auth= from->auth;
   }
+
+  if (fix_lex_user(thd, to))
+    return true;
+
+  return false;
+}
+
+static bool copy_and_check_auth(LEX_USER *to, LEX_USER *from, THD *thd)
+{
+  if (fix_and_copy_user(to, from, thd))
+    return true;
 
   // if changing auth for an existing user
   if (has_auth(to, thd->lex) && find_user_exact(to->host.str, to->user.str))
