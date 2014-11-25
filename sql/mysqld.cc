@@ -424,6 +424,7 @@ my_bool opt_safe_user_create = 0;
 my_bool opt_show_slave_auth_info;
 my_bool opt_log_slave_updates= 0;
 my_bool opt_replicate_annotate_row_events= 0;
+my_bool strict_password_validation= 1;
 char *opt_slave_skip_errors;
 
 /*
