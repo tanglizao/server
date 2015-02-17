@@ -48,6 +48,8 @@ class Item_func_match;
 class File_parser;
 class Key_part_spec;
 
+#define ALLOC_ROOT_SET 1024
+
 #ifdef MYSQL_SERVER
 /*
   There are 8 different type of table access so there is no more than
@@ -2430,6 +2432,15 @@ struct LEX: public Query_tables_list
   List<set_var_base>  var_list;
   List<set_var_base>  stmt_var_list; //SET_STATEMENT values
   List<set_var_base>  old_var_list; // SET STATEMENT old values
+private:
+  Query_arena *arena_for_set_stmt;
+  MEM_ROOT *mem_root_for_set_stmt;
+public:
+  inline bool is_arena_for_set_stmt() {return arena_for_set_stmt != 0;}
+  void set_arena_for_set_stmt(Query_arena *backup);
+  void reset_arena_for_set_stmt(Query_arena *backup);
+  void free_arena_for_set_stmt();
+
   List<Item_func_set_user_var> set_var_list; // in-query assignment list
   List<Item_param>    param_list;
   List<LEX_STRING>    view_list; // view list (list of field names in view)
@@ -2677,10 +2688,22 @@ struct LEX: public Query_tables_list
       limit_rows_examined_cnt= ULONGLONG_MAX;
   }
 
+
+  inline void free_set_stmt_mem_root()
+  {
+    if (mem_root_for_set_stmt)
+    {
+      free_root(mem_root_for_set_stmt, MYF(0));
+      delete mem_root_for_set_stmt;
+      mem_root_for_set_stmt= 0;
+    }
+  }
+
   LEX();
 
   virtual ~LEX()
   {
+    free_set_stmt_mem_root();
     destroy_query_tables_list();
     plugin_unlock_list(NULL, (plugin_ref *)plugins.buffer, plugins.elements);
     delete_dynamic(&plugins);

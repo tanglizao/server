@@ -2628,7 +2628,8 @@ void Query_tables_list::destroy_query_tables_list()
 
 LEX::LEX()
   : explain(NULL),
-    result(0), option_type(OPT_DEFAULT), sphead(0),
+    result(0), arena_for_set_stmt(0), mem_root_for_set_stmt(0),
+    option_type(OPT_DEFAULT), sphead(0),
     is_lex_started(0), limit_rows_examined_cnt(ULONGLONG_MAX)
 {
 
@@ -4223,6 +4224,56 @@ int LEX::print_explain(select_result_sink *output, uint8 explain_flags,
   return res;
 }
 
+void LEX::set_arena_for_set_stmt(Query_arena *backup)
+{
+  DBUG_ENTER("LEX::set_arena_for_set_stmt");
+  DBUG_ASSERT(arena_for_set_stmt== 0);
+  if (!mem_root_for_set_stmt)
+  {
+    mem_root_for_set_stmt= new MEM_ROOT();
+    if (!(mem_root_for_set_stmt))
+      DBUG_VOID_RETURN;
+    init_sql_alloc(mem_root_for_set_stmt, ALLOC_ROOT_SET, ALLOC_ROOT_SET,
+                   MYF(MY_THREAD_SPECIFIC));
+  }
+  if (!(arena_for_set_stmt= new Query_arena(mem_root_for_set_stmt,
+                                            Query_arena::STMT_INITIALIZED)))
+    DBUG_VOID_RETURN;
+  DBUG_PRINT("info", ("mem_root: 0x%lx  arena: 0x%lx",
+                      (ulong) mem_root_for_set_stmt,
+                      (ulong) arena_for_set_stmt));
+  thd->set_n_backup_active_arena(arena_for_set_stmt, backup);
+  DBUG_VOID_RETURN;
+}
+
+
+void LEX::reset_arena_for_set_stmt(Query_arena *backup)
+{
+  DBUG_ENTER("LEX::reset_arena_for_set_stmt");
+  DBUG_ASSERT(arena_for_set_stmt);
+  thd->restore_active_arena(arena_for_set_stmt, backup);
+  DBUG_PRINT("info", ("mem_root: 0x%lx  arena: 0x%lx",
+                      (ulong) arena_for_set_stmt->mem_root,
+                      (ulong) arena_for_set_stmt));
+  DBUG_VOID_RETURN;
+}
+
+
+void LEX::free_arena_for_set_stmt()
+{
+  DBUG_ENTER("LEX::free_arena_for_set_stmt");
+  if (!arena_for_set_stmt)
+    return;
+  DBUG_PRINT("info", ("mem_root: 0x%lx  arena: 0x%lx",
+                      (ulong) arena_for_set_stmt->mem_root,
+                      (ulong) arena_for_set_stmt));
+  arena_for_set_stmt->free_items();
+  delete(arena_for_set_stmt);
+  free_root(mem_root_for_set_stmt, MYF(MY_KEEP_PREALLOC));
+  arena_for_set_stmt= 0;
+  DBUG_VOID_RETURN;
+}
+
 void LEX::restore_set_statement_var()
 {
   DBUG_ENTER("LEX::restore_set_statement_var");
@@ -4231,7 +4282,9 @@ void LEX::restore_set_statement_var()
     DBUG_PRINT("info", ("vars: %d", old_var_list.elements));
     sql_set_variables(thd, &old_var_list, false);
     old_var_list.empty();
+    free_arena_for_set_stmt();
   }
+  DBUG_ASSERT(!is_arena_for_set_stmt());
   DBUG_VOID_RETURN;
 }
 

@@ -3674,6 +3674,7 @@ public:
     return backup;
   }
 
+
   void clear_wakeup_ready() { wakeup_ready= false; }
   /*
     Sleep waiting for others to wake us up with signal_wakeup_ready().
